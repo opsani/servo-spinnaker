@@ -1,0 +1,553 @@
+#!/usr/bin/env python3
+"""
+Optune 'adjust' driver for spinnaker pipelines.
+(C) 2018, Opsani.
+use:
+
+adjust --version
+adjust --info
+adjust --query app_name
+adjust app_name <settings-file.json
+This script requires a configuration file placed at a fixed location (see
+CFG_FILE constant below).
+
+Example CFG_FILE:
+
+spinnaker:
+  api_url: https://api.spinnaker.com/
+  pipeline_user: my-user
+
+  update_pipeline_name: my-app
+  update_pipeline_application: my-pipeline
+
+  invoke_pipeline_name: my-app
+  invoke_pipeline_application: my-pipeline
+  invoke_pipeline_params:
+    param1_name: param1_value
+    param2_name: param2_value
+
+  consul_url: http://example.com/foo # Optional
+  health_check_url: "http://{}:8080/bar" # Optional
+  health_check_timeout: 300 # Optional
+  health_check_ok_string: "<STATUS>OK</STATUS>" # Optional
+  api_client_cert: path/to/file.pem # Optional
+  api_ca_bundle: path/to/ca.crt # Optional
+  consul_client_cert: path/to/file.pem # Optional
+  consul_ca_bundle: path/to/ca.crt # Optional
+
+  components:
+    gui:
+      settings:
+        inst_type:
+          jsonpath:
+            - "$.stages[*].clusters[?(@.stack == 'my-stack')].instanceType"
+        inst_count:
+          use_as_required_n_hosts: True
+          jsonpath:
+            - "$.stages[*].clusters[?(@.stack == 'my-stack')].capacity.desired"
+            - "$.stages[*].clusters[?(@.stack == 'my-stack')].capacity.min"
+            - "$.stages[*].clusters[?(@.stack == 'my-stack')].capacity.max"
+
+"""
+
+from copy import deepcopy
+from jsonpath_ng.ext import parse
+import json
+import requests
+import time
+import yaml
+
+from adjust import Adjust
+
+DESC = "Spinnaker adjust driver for Opsani Optune"
+VERSION = "1.0.0"
+HAS_CANCEL = False
+
+CFG_FILE = "./config.yaml"
+DRIVER_NAME = "spinnaker"
+
+DFLT_PIPELINE_USER = "optune-"
+
+REQUIRED_CFG_PARAMS=[
+    "update_pipeline_name",
+    "update_pipeline_application",
+    "invoke_pipeline_name",
+    "invoke_pipeline_application",
+    "api_url",
+    "consul_url",
+    "health_check_url",
+    "health_check_timeout",
+    "health_check_ok_string",
+    "pipeline_deploy_timeout",
+]
+
+# how many seconds to wait between pipeline status polls
+PIPELINE_STATUS_SLEEP_T = 30
+HOST_HEALTH_RETRY_SLEEP = 30
+
+class SpinnakerDriver(Adjust):
+
+    def _parse_cfg(self):
+        '''
+        load the user-defined application descriptor
+        '''
+
+        try:
+            f = open(CFG_FILE)
+            d = yaml.load(f)
+        except IOError as e:
+            raise Exception(
+                "cannot read configuration from {}:{}".format(CFG_FILE, e.strerror))
+        except yaml.error.YAMLError as e:
+            raise Exception("syntax error in {}: {}".format(CFG_FILE, str(e)))
+        # everything else: raise
+
+        # Valchk
+        assert(DRIVER_NAME in d), \
+            "Missing driver configuration: missing {} section".format(
+                DRIVER_NAME)
+
+        cfg = d[DRIVER_NAME]
+
+        # Check for reuired cfg params
+        for param in REQUIRED_CFG_PARAMS:
+            assert(param in cfg), \
+                "Missing or invalid driver configuration: %s" % param
+
+        assert ("components" in cfg), "Invalid config: missing components key"
+
+        for c_name, c_data in cfg["components"].items():
+            assert ("settings" in c_data), \
+                "Invalid config: Missing settings key for component %s" % c_name
+
+            for s_name, s_data in c_data["settings"].items():
+                assert ("jsonpath" in s_data), \
+                    "Invalid config: Missing jsonpath for component %s setting %s"\
+                    %(c_name, s_name)
+                assert (isinstance(s_data["jsonpath"], list)), \
+                    "Invalid config: jsonpath for component %s setting %s must be a list"\
+                    %(c_name, s_name)
+
+        return cfg
+
+    def _call_api(
+        self,
+        base_url,
+        path,
+        http_verb='GET',
+        headers={'Content-type': 'application/json'},
+        data=None,
+        cert=None,
+        verify=True):
+
+        # Strip trailing /
+        if base_url.endswith("/"):
+            base_url = base_url[:-1]
+
+        url = base_url + path
+
+        self.debug("Calling %s on %s" % (http_verb, url))
+
+        response = requests.request(
+            http_verb, url,
+            data = json.dumps(data) if data else None,
+            headers = headers,
+            cert = cert,
+            verify = verify)
+
+        try:
+            resp_data = response.json()
+        except:
+            resp_data = {}
+
+        return (response.status_code, resp_data)
+
+
+    def _get_pipeline_cfg(self, api_url, application, pipeline, cert, verify):
+        '''
+        Get pipeline config from Spinnaker
+        '''
+
+        path = "/applications/%s/pipelineConfigs/%s" % (application, pipeline)
+
+        st_code, data = self._call_api(api_url, path, cert=cert, verify=verify)
+
+        assert (st_code == 200), \
+            "Got unexpected status code %s from API server" % st_code
+
+        assert (data), "Empty data for pipeline"
+
+        return data
+
+
+    def _post_pipeline_cfg(self, api_url, pipeline, cert, verify):
+        '''
+        Post pipeline config to Spinnaker
+        '''
+
+        path = "/pipelines"
+
+        st_code, p_data = self._call_api(
+            api_url, path, 'POST', data=pipeline, cert=cert, verify=verify)
+
+        assert (st_code == 200), \
+            "Got unexpected status code %s from API server, data %s" % (
+                st_code, p_data)
+
+
+    def _update_pipeline_data(self, pipeline, cfg):
+
+        input_comps = self.input_data["application"]["components"]
+
+        updated_pipeline = deepcopy(pipeline)
+
+        for c_name, c_data in input_comps.items():
+            for s_name, s_data in c_data["settings"].items():
+                cfg_setting = cfg["components"][c_name]["settings"][s_name]
+
+                for path in cfg_setting["jsonpath"]:
+
+                    jsonpath_expr = parse(path)
+                    match = jsonpath_expr.find(updated_pipeline)
+
+                    assert match, \
+                        "Failed to find path %s for setting %s of component %s in pipeline config" % (
+                            path, s_name, c_name)
+
+                    self.debug("Found matches for %s:" % path, len(match))
+
+                    jsonpath_expr.update(updated_pipeline, s_data["value"])
+
+        return updated_pipeline
+
+
+    def _check_if_pipeline_is_runnning(
+            self,
+            api_url,
+            application,
+            pipeline,
+            cert,
+            verify):
+        '''
+        Raises an exception if pipeline is already running
+        '''
+
+        path = "/applications/%s/pipelines?statuses=%s" % (
+            application, "RUNNING,SUSPENDED,PAUSED,NOT_STARTED")
+
+        st_code, data = self._call_api(api_url, path, cert=cert, verify=verify)
+
+        assert (st_code == 200), \
+            "Got unexpected status code %s from API server" % st_code
+
+        running_pipelines = map(lambda x: x["name"], data)
+
+        self.debug(
+            "Running pipelines for application %s: %s" % (
+                application, str(list(running_pipelines))))
+
+        assert(pipeline not in running_pipelines), \
+            "Pipeline %s for application %s is already running" % (
+                pipeline, application)
+
+
+    def _get_pipeline_status(self, api_url, pipeline_id, cert, verify):
+        '''
+        Returns the status of a pipeline or raises an exception if not found
+        '''
+
+        path = pipeline_id
+
+        st_code, data = self._call_api(api_url, path, cert=cert, verify=verify)
+
+        assert (st_code == 200), \
+            "Got unexpected status code %s from API server" % st_code
+
+        return data
+
+
+    def _wait_for_pipeline_to_finish(
+            self,
+            api_url,
+            pipeline_id,
+            timeout,
+            cert,
+            verify):
+        '''
+        Waits untill pipeline completes or raises an exception if it does not
+        happen in a given time
+        '''
+
+        wait_until = time.time() + timeout
+
+        while True:
+            time.sleep(PIPELINE_STATUS_SLEEP_T)
+            status_data = self._get_pipeline_status(
+                api_url, pipeline_id, cert, verify)
+            status = status_data["status"]
+            if status == "SUCCEEDED":
+                self.debug("Pipeline completed successfully")
+                break
+            elif status == "RUNNING":
+                if time.time() >= wait_until:
+                    raise Exception(
+                        "Timeout while waiting for pipeline ref id %s to complete" % (
+                            pipeline_id))
+                else:
+                    continue
+            else:
+                raise Exception(
+                    "Unexpected status %s for pipeline ref id %s, status data: %s" % (
+                        status, pipeline_id, str(status_data)))
+
+
+    def _invoke_pipeline(self, api_url, application, pipeline, payload,
+            cert, verify):
+        '''
+        Invokes the specified pipeline and returns ref_pipeline_id
+        '''
+
+        path = "/pipelines/%s/%s" % (application, pipeline)
+
+        st_code, data = self._call_api(
+            api_url, path, "POST", data=payload, cert=cert, verify=verify)
+
+        assert (st_code == 202), \
+            "Got unexpected status code %s from API server" % st_code
+
+        ref_pipeline_id = data['ref']
+
+        self.debug(
+            "Invoked pipeline %s for application %s, got ref id: %s" % (
+                pipeline, application, ref_pipeline_id))
+
+        return ref_pipeline_id
+
+    def _get_consul_hosts(self, consul_url, cert, verify):
+
+        self.debug(
+            "Getting list of instances from consul at %s with cert %s, ca %s" % (
+                consul_url, cert, verify))
+
+        r = requests.get(consul_url, cert=cert, verify=verify)
+
+        data = r.json()
+
+        hosts = list(map(lambda x: x["Node"]["Address"], data))
+
+        self.debug("Consul hosts:", hosts)
+
+        return hosts
+
+    def _get_n_required_hosts(self, cfg, input_data):
+
+        for c_name, c_data in cfg["components"].items():
+            for s_name, s_data in c_data["settings"].items():
+                if "use_as_required_n_hosts" in s_data \
+                        and s_data["use_as_required_n_hosts"] == True:
+
+                    try:
+                        c_in = input_data["application"]["components"][c_name]
+                        return c_in["settings"][s_name]["value"]
+                    except:
+                        return None
+
+
+    def _check_hosts_health(self, cfg, input_data):
+
+        # Check for required health check configuration
+        if ("consul_url" not in cfg or "health_check_url" not in cfg or
+                "health_check_timeout" not in cfg or
+                "health_check_ok_string"not in cfg):
+            self.debug("Skipping healthcheck due to missing configuration")
+            return
+
+        n_required_hosts = self._get_n_required_hosts(cfg, input_data)
+
+        assert (n_required_hosts is not None), \
+            "Could not get n_required_hosts based on config and input data: %s"%(
+                str(input_data))
+
+        timeout = int(cfg["health_check_timeout"])
+        wait_until = time.time() + timeout
+
+        hchk_ok_string = cfg["health_check_ok_string"]
+
+        self.debug("Checking health for %s seconds, expecting %s hosts" % (
+            timeout, n_required_hosts))
+
+        # Make sure all hosts are healthy
+        while time.time() <= wait_until:
+            self.debug("Sleeping for %s seconds before health check" %
+                       HOST_HEALTH_RETRY_SLEEP)
+            time.sleep(HOST_HEALTH_RETRY_SLEEP)
+
+            hosts = self._get_consul_hosts(
+                cfg["consul_url"],
+                cfg.get("consul_client_cert", None),
+                cfg.get("consul_ca_bundle", True))
+
+            n_hosts = len(hosts)
+            self.debug("Got %s hosts from consul" % n_hosts)
+
+            if n_hosts != n_required_hosts:
+                self.debug("Need %s hosts in consule, got %s" % (
+                    n_required_hosts, n_hosts))
+                continue
+
+            for host in hosts:
+                hchk_url = cfg['health_check_url'].format(host)
+                # check health
+                try:
+                    r = requests.get(hchk_url, verify=False)
+                    assert(r.status_code == 200), \
+                        "Healthcheck returned status " + str(r.status_code)
+                    assert(hchk_ok_string in r.text), \
+                        "Did not find string '{}' in healthcheck response".format(
+                            hchk_ok_string)
+
+                    host_healthy = True
+                    self.debug("Healthcheck succeeded for host", host)
+
+                except Exception as e:
+                    self.debug(
+                        "Healthcheck failed for host %s, error was:" % host, e)
+                    # this stops the current healthcheck try for all hosts, next
+                    # try will begin with polling consul again
+                    break
+
+        # If we got here, we timeout out
+        raise Exception(
+            "Timeout while waiting for all %s hosts to be healthy" % n_required_hosts)
+
+
+    # Overwritten
+    def query(self):
+        # Parse driver descriptor
+        cfg = self._parse_cfg()
+
+        cert = cfg.get("api_client_cert", None)
+        verify = cfg.get("api_ca_bundle", None)
+
+        # Get pipeline config
+        pipeline_data = self._get_pipeline_cfg(
+            cfg["api_url"], cfg["update_pipeline_application"],
+            cfg["update_pipeline_name"], cert=cert, verify=verify)
+
+        response = {}
+        response["components"] = {}
+
+        # Get setting values
+        for component, component_data in cfg["components"].items():
+
+            settings_values = {}
+
+            for setting, settings_data in component_data["settings"].items():
+                path = settings_data["jsonpath"][0]
+
+                jsonpath_expr = parse(path)
+                match = jsonpath_expr.find(pipeline_data)
+                if not match:
+                    raise Exception(
+                        "Failed to find path %s for setting %s of component %s in pipeline config" % (
+                            path, setting, component))
+
+                settings_values[setting] = {
+                    "value": match[0].value
+                }
+
+            response["components"][component] = {
+                "settings": settings_values
+            }
+
+        return response
+
+
+
+    # Overwritten
+    def adjust(self):
+        # Parse driver descriptor
+        cfg = self._parse_cfg()
+
+        cert = cfg.get("api_client_cert", None)
+        verify = cfg.get("api_ca_bundle", None)
+
+        # Validate input
+        assert ("application" in self.input_data), \
+            "Invalid input: missing application key"
+
+        assert ("components" in self.input_data["application"]), \
+            "Invalid input: missing application.components key"
+
+        comps = self.input_data["application"]["components"]
+
+        for comp_name, comp_data in comps.items():
+            assert (comp_name in cfg["components"]), \
+                "Component name %s not present in config" % comp_name
+
+            assert ("settings" in comp_data), \
+                "Missing settings for component %s" % comp_name
+
+            for s_name, _ in comp_data["settings"].items():
+                assert (s_name in cfg["components"][comp_name]["settings"]), \
+                    "Unknown setting %s for component %s" % (s_name, comp_name)
+
+        # Get pipeline config
+        pipeline_data = self._get_pipeline_cfg(
+            cfg["api_url"], cfg["update_pipeline_application"],
+            cfg["update_pipeline_name"], cert=cert, verify=verify)
+
+        # Generate updated pipeline
+        updated_pipeline = self._update_pipeline_data(pipeline_data, cfg)
+
+        # Push new pipeline config
+        self._post_pipeline_cfg(cfg["api_url"], updated_pipeline, cert, verify)
+
+        pipeline_id = updated_pipeline["id"]
+
+        # TODO DELME DEBUG: Poll consul
+        try:
+            self.debug("Getting consul hosts before deploy")
+            hosts = self._get_consul_hosts(
+                cfg["consul_url"],
+                cfg.get("consul_client_cert", None),
+                cfg.get("consul_ca_bundle", True))
+        except Exception as e:
+            self.debug(e)
+
+        # Check if pipeline is already running
+        self._check_if_pipeline_is_runnning(
+            cfg["api_url"], cfg["invoke_pipeline_application"],
+            cfg["invoke_pipeline_name"], cert, verify)
+
+        # Run deploy
+        payload = {
+            "type": "manual",
+            "user": cfg.get("pipeline_user", DFLT_PIPELINE_USER),
+            "parameters": cfg.get("pipeline_params", {}),
+        }
+
+        ref_pipeline_id = self._invoke_pipeline(
+            cfg["api_url"], cfg["invoke_pipeline_application"],
+            cfg["invoke_pipeline_name"], payload, cert, verify)
+
+        # Poll status
+        self._wait_for_pipeline_to_finish(
+            cfg["api_url"],
+            ref_pipeline_id,
+            cfg["pipeline_deploy_timeout"],
+            cert,
+            verify)
+
+
+        # Make sure hosts are up and running
+        # TODO: this should be a separate driver as (a) it is not spinnaker
+        # related and (b) ties some of the logic to a setting value
+        self._check_hosts_health(cfg, self.input_data)
+
+
+
+if __name__ == '__main__':
+    driver = SpinnakerDriver(VERSION, DESC, HAS_CANCEL)
+    driver.run()
+
