@@ -27,9 +27,7 @@ spinnaker:
     param2_name: param2_value
 
   consul_url: http://example.com/foo # Optional
-  health_check_url: "http://{}:8080/bar" # Optional
   health_check_timeout: 300 # Optional
-  health_check_ok_string: "<STATUS>OK</STATUS>" # Optional
   api_client_cert: path/to/file.pem # Optional
   api_ca_bundle: path/to/ca.crt # Optional
   consul_client_cert: path/to/file.pem # Optional
@@ -74,10 +72,6 @@ REQUIRED_CFG_PARAMS=[
     "invoke_pipeline_name",
     "invoke_pipeline_application",
     "api_url",
-    "consul_url",
-    "health_check_url",
-    "health_check_timeout",
-    "health_check_ok_string",
     "pipeline_deploy_timeout",
 ]
 
@@ -333,13 +327,18 @@ class SpinnakerDriver(Adjust):
 
         data = r.json()
 
-        hosts = list(map(lambda x: x["Node"]["Address"], data))
+        hosts = list(map(lambda x: {
+            "ID": x["Node"]["ID"],
+            "Node": x["Node"]["Node"],
+            "Address": x["Node"]["Address"],
+            "CreateIndex": x["Node"]["CreateIndex"],
+        }, data))
 
-        self.debug("Consul hosts:", hosts)
+        self.debug("Consul hosts (%s):" % len(hosts), hosts)
 
         return hosts
 
-    def _get_n_required_hosts(self, cfg, input_data):
+    def _get_n_required_hosts(self, cfg):
 
         for c_name, c_data in cfg["components"].items():
             for s_name, s_data in c_data["settings"].items():
@@ -347,26 +346,23 @@ class SpinnakerDriver(Adjust):
                         and s_data["use_as_required_n_hosts"] == True:
 
                     try:
-                        c_in = input_data["application"]["components"][c_name]
+                        c_in = self.input_data["application"]["components"][c_name]
                         return c_in["settings"][s_name]["value"]
                     except:
                         return None
 
-
-    def _check_hosts_health(self, cfg, input_data):
+    def _check_hosts_health(self, cfg, hosts_old):
 
         # Check for required health check configuration
-        if ("consul_url" not in cfg or "health_check_url" not in cfg or
-                "health_check_timeout" not in cfg or
-                "health_check_ok_string"not in cfg):
+        if ("consul_url" not in cfg or "health_check_timeout" not in cfg):
             self.debug("Skipping healthcheck due to missing configuration")
             return
 
-        n_required_hosts = self._get_n_required_hosts(cfg, input_data)
+        n_required_hosts = self._get_n_required_hosts(cfg)
 
         assert (n_required_hosts is not None), \
             "Could not get n_required_hosts based on config and input data: %s"%(
-                str(input_data))
+                str(self.input_data))
 
         timeout = int(cfg["health_check_timeout"])
         wait_until = time.time() + timeout
@@ -387,6 +383,7 @@ class SpinnakerDriver(Adjust):
                 cfg.get("consul_client_cert", None),
                 cfg.get("consul_ca_bundle", True))
 
+            # Make sure we have the required number of hosts
             n_hosts = len(hosts)
             self.debug("Got %s hosts from consul" % n_hosts)
 
@@ -395,26 +392,17 @@ class SpinnakerDriver(Adjust):
                     n_required_hosts, n_hosts))
                 continue
 
-            for host in hosts:
-                hchk_url = cfg['health_check_url'].format(host)
-                # check health
-                try:
-                    r = requests.get(hchk_url, verify=False)
-                    assert(r.status_code == 200), \
-                        "Healthcheck returned status " + str(r.status_code)
-                    assert(hchk_ok_string in r.text), \
-                        "Did not find string '{}' in healthcheck response".format(
-                            hchk_ok_string)
+            # Make sure the hosts we got were not present before the deploy
+            unchanged_hosts = list(filter(lambda x: x in hosts_old, hosts))
+            if unchanged_hosts:
+                self.debug("The following", len(unchanged_hosts),
+                    "hosts reported by consul after the deploy were present " +
+                    "before the deploy:",  unchanged_hosts)
+                continue
+            else:
+                self.debug("All hosts reported by consul after the deploy are new")
+                return
 
-                    host_healthy = True
-                    self.debug("Healthcheck succeeded for host", host)
-
-                except Exception as e:
-                    self.debug(
-                        "Healthcheck failed for host %s, error was:" % host, e)
-                    # this stops the current healthcheck try for all hosts, next
-                    # try will begin with polling consul again
-                    break
 
         # If we got here, we timeout out
         raise Exception(
@@ -505,15 +493,16 @@ class SpinnakerDriver(Adjust):
 
         pipeline_id = updated_pipeline["id"]
 
-        # TODO DELME DEBUG: Poll consul
+        # Get list of current hosts from consul
         try:
             self.debug("Getting consul hosts before deploy")
-            hosts = self._get_consul_hosts(
+            hosts_old = self._get_consul_hosts(
                 cfg["consul_url"],
                 cfg.get("consul_client_cert", None),
                 cfg.get("consul_ca_bundle", True))
         except Exception as e:
-            self.debug(e)
+            hosts_old = []
+            self.debug("Failed to get consul hosts before deploy", e)
 
         # Check if pipeline is already running
         self._check_if_pipeline_is_runnning(
@@ -543,7 +532,7 @@ class SpinnakerDriver(Adjust):
         # Make sure hosts are up and running
         # TODO: this should be a separate driver as (a) it is not spinnaker
         # related and (b) ties some of the logic to a setting value
-        self._check_hosts_health(cfg, self.input_data)
+        self._check_hosts_health(cfg, hosts_old)
 
 
 
