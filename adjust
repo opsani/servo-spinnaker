@@ -291,11 +291,21 @@ class SpinnakerDriver(Adjust):
                         "Timeout while waiting for pipeline ref id %s to complete" % (
                             pipeline_id))
                 else:
-                    # Print progress, based on timeout
-                    progress = int(100*(now - start_time)/timeout)
+                    try:
+                        # try to get progress based on pipeline tasks status
+                        tasks = [task for stage in data['stages']
+                            for task in stage["tasks"]]
+                        n_done = len([t for t in tasks if t["endTime"]])
+                        n_total = len(tasks)
+                        progress = int(100*(n_done)/n_total)
+                        message = "Based on pipeline task status"
+                    except:
+                        # Print progress, based on timeout
+                        progress = int(100*(now - start_time)/timeout)
+                        message = "Based on pipeline timeout value"
                     prog_data = {
                         'progress': progress,
-                        'message': status_data,
+                        'message': message,
                     }
                     print(json.dumps(prog_data), flush=True)
                     continue # keep polling for status
