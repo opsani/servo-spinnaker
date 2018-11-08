@@ -272,7 +272,8 @@ class SpinnakerDriver(Adjust):
         happen in a given time
         '''
 
-        wait_until = time.time() + timeout
+        start_time = time.time()
+        wait_until = start_time + timeout
 
         while True:
             time.sleep(PIPELINE_STATUS_SLEEP_T)
@@ -283,12 +284,21 @@ class SpinnakerDriver(Adjust):
                 self.debug("Pipeline completed successfully")
                 break
             elif status == "RUNNING":
-                if time.time() >= wait_until:
+                now = time.time()
+
+                if now >= wait_until:
                     raise Exception(
                         "Timeout while waiting for pipeline ref id %s to complete" % (
                             pipeline_id))
                 else:
-                    continue
+                    # Print progress, based on timeout
+                    progress = int(100*(now - start_time)/timeout)
+                    prog_data = {
+                        'progress': progress,
+                        'message': status_data,
+                    }
+                    print(json.dumps(prog_data), flush=True)
+                    continue # keep polling for status
             else:
                 raise Exception(
                     "Unexpected status %s for pipeline ref id %s, status data: %s" % (
