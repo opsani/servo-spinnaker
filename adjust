@@ -239,11 +239,12 @@ class SpinnakerDriver(Adjust):
         assert (st_code == 200), \
             "Got unexpected status code %s from API server" % st_code
 
-        running_pipelines = map(lambda x: x["name"], data)
+        running_pipelines = list(map(lambda x: x["name"], data))
 
         self.debug(
-            "Running pipelines for application %s: %s" % (
-                application, str(list(running_pipelines))))
+            "Running pipelines for application %s: %s, pipeline '%s' is %s" % (
+                application, str(running_pipelines), pipeline,
+                "running" if pipeline in running_pipelines else "not running"))
 
         assert(pipeline not in running_pipelines), \
             "Pipeline %s for application %s is already running" % (
