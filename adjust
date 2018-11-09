@@ -392,8 +392,6 @@ class SpinnakerDriver(Adjust):
         timeout = int(cfg["health_check_timeout"])
         wait_until = time.time() + timeout
 
-        hchk_ok_string = cfg["health_check_ok_string"]
-
         self.debug("Checking health for %s seconds, expecting %s hosts" % (
             timeout, n_required_hosts))
 
