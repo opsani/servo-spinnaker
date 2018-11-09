@@ -25,6 +25,7 @@ The following parameters can be configured for the driver. The configuration sho
 * `components/${name}/settings`: Settings that the driver will adjust. Each setting supports the following keys:
   * `jsonpath`: list of JSON paths in the pipeline that will be updated with the value of this setting. See [jsonpath-ng docs](https://github.com/h2non/jsonpath-ng) for details on how path can be specified.
   * `use_as_required_n_hosts`: If set to `True`, the value of this setting will be used as the number of required hosts to check for when polling consul (see `consul_url`). Default: `False`
+  * `convert_to_int`: If set to `True`, convert the setting value to int before updating the pipeline with it.
 
 Example `config.yaml`:
 
@@ -57,13 +58,13 @@ spinnaker:
           jsonpath:
             - "$.stages[*].clusters[?(@.stack == 'my-stack')].instanceType"
         inst_count:
+          convert_to_int: True
           use_as_required_n_hosts: True
           jsonpath:
             - "$.stages[*].clusters[?(@.stack == 'my-stack')].capacity.desired"
             - "$.stages[*].clusters[?(@.stack == 'my-stack')].capacity.min"
             - "$.stages[*].clusters[?(@.stack == 'my-stack')].capacity.max"
 
-"""
 ```
 
 
