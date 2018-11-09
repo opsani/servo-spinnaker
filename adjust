@@ -299,7 +299,7 @@ class SpinnakerDriver(Adjust):
                 else:
                     try:
                         # try to get progress based on pipeline tasks status
-                        tasks = [task for stage in data['stages']
+                        tasks = [task for stage in status_data['stages']
                             for task in stage["tasks"]]
                         n_done = len([t for t in tasks if t["endTime"]])
                         n_total = len(tasks)
