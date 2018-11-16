@@ -60,6 +60,7 @@ from adjust import Adjust
 DESC = "Spinnaker adjust driver for Opsani Optune"
 VERSION = "1.0.0"
 HAS_CANCEL = False
+PROGRESS_INTERVAL = 30
 
 CFG_FILE = "./config.yaml"
 DRIVER_NAME = "spinnaker"
@@ -309,11 +310,10 @@ class SpinnakerDriver(Adjust):
                         # Print progress, based on timeout
                         progress = int(100*(now - start_time)/timeout)
                         message = "Based on pipeline timeout value"
-                    prog_data = {
-                        'progress': progress,
-                        'message': message,
-                    }
-                    print(json.dumps(prog_data), flush=True)
+
+                    # normalize progress to 90%, leave other 10% for status poll
+                    self.progress = int(0.9 * progress)
+                    self.print_progress(message=message)
                     continue # keep polling for status
             else:
                 raise Exception(
@@ -410,6 +410,16 @@ class SpinnakerDriver(Adjust):
             # Make sure we have the required number of hosts
             n_hosts = len(hosts)
             self.debug("Got %s hosts from consul" % n_hosts)
+
+            # Update progress, assuming the healthcheck starts at 90% and goes
+            # up to 99% while running, 100% when completed
+            remaining_time = max(wait_until - time.time(), 0)
+            time_passed = timeout - remaining_time
+            hck_progress = int(100 * (time_passed / timeout))
+            self.progress = min(99, 90 + int(hck_progress / 10))
+            self.print_progress(
+                message="Checking health, got %s hosts" % n_hosts)
+
 
             if n_hosts != n_required_hosts:
                 self.debug("Need %s hosts in consule, got %s" % (
@@ -558,9 +568,11 @@ class SpinnakerDriver(Adjust):
         # related and (b) ties some of the logic to a setting value
         self._check_hosts_health(cfg, hosts_old)
 
+        self.progress = 100
+        self.print_progress(message="Done")
 
 
 if __name__ == '__main__':
-    driver = SpinnakerDriver(VERSION, DESC, HAS_CANCEL)
+    driver = SpinnakerDriver(VERSION, DESC, HAS_CANCEL, PROGRESS_INTERVAL)
     driver.run()
 
