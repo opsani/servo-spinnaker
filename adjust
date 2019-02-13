@@ -547,7 +547,7 @@ class SpinnakerDriver(Adjust):
         payload = {
             "type": "manual",
             "user": cfg.get("pipeline_user", DFLT_PIPELINE_USER),
-            "parameters": cfg.get("pipeline_params", {}),
+            "parameters": cfg.get("invoke_pipeline_params", {}),
         }
 
         ref_pipeline_id = self._invoke_pipeline(
