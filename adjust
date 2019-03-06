@@ -197,13 +197,13 @@ class SpinnakerDriver(Adjust):
         updated_pipeline = deepcopy(pipeline)
 
         for c_name, c_data in input_comps.items():
-            for s_name, s_data in c_data["settings"].items():
-                cfg_setting = cfg["components"][c_name]["settings"][s_name]
+            cfg_settings = cfg["components"][c_name]["settings"]
+            for s_name, cfg_setting in cfg_settings.items():
+                value = self.encode_value_if_needed(
+                    s_name, cfg_setting, c_data["settings"])
 
                 if cfg_setting.get("convert_to_int", False):
-                    v = int(s_data["value"])
-                else:
-                    v = s_data["value"]
+                    value = int(value)
 
                 for path in cfg_setting["jsonpath"]:
 
@@ -216,7 +216,7 @@ class SpinnakerDriver(Adjust):
 
                     self.debug("Found matches for %s:" % path, len(match))
 
-                    jsonpath_expr.update(updated_pipeline, v)
+                    jsonpath_expr.update(updated_pipeline, value)
 
         return updated_pipeline
 
@@ -443,6 +443,7 @@ class SpinnakerDriver(Adjust):
             "Timeout while waiting for all %s hosts to be healthy" % n_required_hosts)
 
 
+
     # Overwritten
     def query(self):
         # Parse driver descriptor
@@ -474,9 +475,10 @@ class SpinnakerDriver(Adjust):
                         "Failed to find path %s for setting %s of component %s in pipeline config" % (
                             path, setting, component))
 
-                settings_values[setting] = {
-                    "value": match[0].value
-                }
+                value = match[0].value
+                s_data = self.encode_describe_if_needed(
+                    setting, settings_data, value)
+                settings_values.update(s_data)
 
             response["components"][component] = {
                 "settings": settings_values
@@ -510,8 +512,11 @@ class SpinnakerDriver(Adjust):
             assert ("settings" in comp_data), \
                 "Missing settings for component %s" % comp_name
 
+            oco_settings = self.get_oco_settings(
+                cfg["components"][comp_name]["settings"])
+
             for s_name, _ in comp_data["settings"].items():
-                assert (s_name in cfg["components"][comp_name]["settings"]), \
+                assert (s_name in oco_settings), \
                     "Unknown setting %s for component %s" % (s_name, comp_name)
 
         # Get pipeline config
