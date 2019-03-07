@@ -548,11 +548,16 @@ class SpinnakerDriver(Adjust):
             cfg["api_url"], cfg["invoke_pipeline_application"],
             cfg["invoke_pipeline_name"], cert, verify)
 
+        params = cfg.get("invoke_pipeline_params", {})
+        # If invoke_pipeline_params is not set, use annotations
+        if not params:
+            params = self.input_data["application"].get("annotations", {})
+
         # Run deploy
         payload = {
             "type": "manual",
             "user": cfg.get("pipeline_user", DFLT_PIPELINE_USER),
-            "parameters": cfg.get("invoke_pipeline_params", {}),
+            "parameters": params,
         }
 
         ref_pipeline_id = self._invoke_pipeline(
