@@ -27,6 +27,8 @@ The following parameters can be configured for the driver. The configuration sho
   * `use_as_required_n_hosts`: If set to `True`, the value of this setting will be used as the number of required hosts to check for when polling consul (see `consul_url`). Default: `False`
   * `convert_to_int`: If set to `True`, convert the setting value to int before updating the pipeline with it.
 
+This driver supports [JVM encoder](https://github.com/opsani/encoder-jvm) setting, i.e. combine multiple JVM settings as a single string that can be appended to Java's command line (see example config below).
+
 Example `config.yaml`:
 
 ```
@@ -64,6 +66,35 @@ spinnaker:
             - "$.stages[*].clusters[?(@.stack == 'my-stack')].capacity.desired"
             - "$.stages[*].clusters[?(@.stack == 'my-stack')].capacity.min"
             - "$.stages[*].clusters[?(@.stack == 'my-stack')].capacity.max"
+
+        # Sample configuration for JVM settings that will be passed as string in Spinnaker tag (ends up as an EC2 tag)
+        jvm_params:
+          jsonpath:
+            - "$.stages[*].clusters[?(@.stack == 'my_stack')].tags['optune:java:args']"
+          encoder:
+            name: jvm
+            before:
+              - "-XX:+PrintStringDeduplicationStatistics"
+              - "-XX:+UnlockExperimentalVMOptions"
+            settings:
+              InitialHeapSize:
+                min: 6
+                max: 12.5
+                step: 0.5
+              MaxHeapSize:
+                min: 6
+                max: 12.5
+                step: 0.5
+              G1NewSizePercent:
+                min: 5
+                max: 40
+                step: 5
+              G1ReservePercent:
+                min: 10
+                max: 30
+                step: 5
+              UseStringDeduplication: {}
+
 
 ```
 
