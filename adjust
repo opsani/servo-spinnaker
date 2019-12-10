@@ -519,6 +519,11 @@ class SpinnakerDriver(Adjust):
                 assert (s_name in oco_settings), \
                     "Unknown setting %s for component %s" % (s_name, comp_name)
 
+        # execute pre_cmd, if any
+        pre_cmd = cfg.get('pre_cmd', None)
+        if pre_cmd is not None:
+            self._run_command(pre_cmd, pre=True)
+
         # Get pipeline config
         pipeline_data = self._get_pipeline_cfg(
             cfg["api_url"], cfg["update_pipeline_application"],
@@ -577,6 +582,11 @@ class SpinnakerDriver(Adjust):
         # TODO: this should be a separate driver as (a) it is not spinnaker
         # related and (b) ties some of the logic to a setting value
         self._check_hosts_health(cfg, hosts_old)
+
+        # execute post_cmd, if any
+        post_cmd = cfg.get('post_cmd', None)
+        if post_cmd is not None:
+            self._run_command(post_cmd, pre=False)
 
         self.progress = 100
         self.print_progress(message="Done")
